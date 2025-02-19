@@ -43,7 +43,7 @@ func (f *Filer) appendToFile(targetFile string, data []byte) error {
 	entry.Chunks = append(entry.GetChunks(), uploadResult.ToPbFileChunk(assignResult.Fid, offset, time.Now().UnixNano()))
 
 	// update the entry
-	err = f.CreateEntry(context.Background(), entry, false, false, nil, false)
+	err = f.CreateEntry(context.Background(), entry, false, false, nil, false, f.MaxFilenameLength)
 
 	return err
 }
@@ -77,7 +77,13 @@ func (f *Filer) assignAndUpload(targetFile string, data []byte) (*operation.Assi
 		PairMap:           nil,
 		Jwt:               assignResult.Auth,
 	}
-	uploadResult, err := operation.UploadData(data, uploadOption)
+
+	uploader, err := operation.NewUploader()
+	if err != nil {
+		return nil, nil, fmt.Errorf("upload data %s: %v", targetUrl, err)
+	}
+
+	uploadResult, err := uploader.UploadData(data, uploadOption)
 	if err != nil {
 		return nil, nil, fmt.Errorf("upload data %s: %v", targetUrl, err)
 	}

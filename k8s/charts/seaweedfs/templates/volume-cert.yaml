@@ -1,4 +1,4 @@
-{{- if .Values.global.enableSecurity }}
+{{- if and .Values.global.enableSecurity (not .Values.certificates.externalCertificates.enabled)}}
 apiVersion: cert-manager.io/v1{{ if .Values.global.certificates.alphacrds }}alpha1{{ end }}
 kind: Certificate
 metadata:
@@ -10,6 +10,10 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: volume
+{{- if .Values.volume.annotations }}
+  annotations:
+    {{- toYaml .Values.volume.annotations | nindent 4 }}
+{{- end }}
 spec:
   secretName: {{ template "seaweedfs.name" . }}-volume-cert
   issuerRef:

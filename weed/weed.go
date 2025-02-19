@@ -3,12 +3,8 @@ package main
 import (
 	"embed"
 	"fmt"
-	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
-	"github.com/seaweedfs/seaweedfs/weed/util"
-	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
 	"io"
 	"io/fs"
-	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -17,8 +13,14 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
+
+	"github.com/getsentry/sentry-go"
 	"github.com/seaweedfs/seaweedfs/weed/command"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var IsDebug *bool
@@ -48,8 +50,19 @@ func init() {
 func main() {
 	glog.MaxSize = 1024 * 1024 * 10
 	glog.MaxFileCount = 5
-	rand.Seed(time.Now().UnixNano())
 	flag.Usage = usage
+
+	err := sentry.Init(sentry.ClientOptions{
+		SampleRate:       0.1,
+		EnableTracing:    true,
+		TracesSampleRate: 0.1,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sentry.Init: %v", err)
+	}
+	// Flush buffered events before the program terminates.
+	// Set the timeout to the maximum duration the program can afford to wait.
+	defer sentry.Flush(2 * time.Second)
 
 	if command.AutocompleteMain(commands) {
 		return
@@ -73,6 +86,7 @@ func main() {
 		return
 	}
 
+	util_http.InitGlobalHttpClient()
 	for _, cmd := range commands {
 		if cmd.Name() == args[0] && cmd.Run != nil {
 			cmd.Flag.Usage = func() { cmd.Usage() }

@@ -17,6 +17,7 @@ const (
 	TrivialOnError EventErrorType = iota
 	FatalOnError
 	RetryForeverOnError
+	DontLogError
 )
 
 // MetadataFollowOption is used to control the behavior of the metadata following
@@ -90,12 +91,14 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 				case FatalOnError:
 					glog.Fatalf("process %v: %v", resp, err)
 				case RetryForeverOnError:
-					util.RetryForever("followMetaUpdates", func() error {
+					util.RetryUntil("followMetaUpdates", func() error {
 						return processEventFn(resp)
 					}, func(err error) bool {
 						glog.Errorf("process %v: %v", resp, err)
 						return true
 					})
+				case DontLogError:
+					// pass
 				default:
 					glog.Errorf("process %v: %v", resp, err)
 				}

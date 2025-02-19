@@ -1,72 +1,137 @@
 package sub_client
 
 import (
-	"context"
-	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mq/topic"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"sync"
+	"time"
 )
+
+type ProcessorState struct {
+	stopCh chan struct{}
+}
 
 // Subscribe subscribes to a topic's specified partitions.
 // If a partition is moved to another broker, the subscriber will automatically reconnect to the new broker.
 
 func (sub *TopicSubscriber) Subscribe() error {
+
+	go sub.startProcessors()
+
+	// loop forever
+	// TODO shutdown the subscriber when not needed anymore
+	sub.doKeepConnectedToSubCoordinator()
+
+	return nil
+}
+
+func (sub *TopicSubscriber) startProcessors() {
+	// listen to the messages from the sub coordinator
+	// start one processor per partition
 	var wg sync.WaitGroup
-	for _, brokerPartitionAssignment := range sub.brokerPartitionAssignments {
-		brokerAddress := brokerPartitionAssignment.LeaderBroker
-		grpcConnection, err := pb.GrpcDial(context.Background(), brokerAddress, true, sub.SubscriberConfig.GrpcDialOption)
-		if err != nil {
-			return fmt.Errorf("dial broker %s: %v", brokerAddress, err)
-		}
-		brokerClient := mq_pb.NewSeaweedMessagingClient(grpcConnection)
-		subscribeClient, err := brokerClient.Subscribe(context.Background(), &mq_pb.SubscribeRequest{
-			Consumer: &mq_pb.SubscribeRequest_Consumer{
-				ConsumerGroup: sub.SubscriberConfig.GroupId,
-				ConsumerId:    sub.SubscriberConfig.GroupInstanceId,
-			},
-			Cursor: &mq_pb.SubscribeRequest_Cursor{
-				Topic: &mq_pb.Topic{
-					Namespace: sub.ContentConfig.Namespace,
-					Name:      sub.ContentConfig.Topic,
-				},
-				Partition: &mq_pb.Partition{
-					RingSize:   brokerPartitionAssignment.Partition.RingSize,
-					RangeStart: brokerPartitionAssignment.Partition.RangeStart,
-					RangeStop:  brokerPartitionAssignment.Partition.RangeStop,
-				},
-				Filter: sub.ContentConfig.Filter,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("create subscribe client: %v", err)
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if sub.OnCompletionFunc != nil {
-				defer sub.OnCompletionFunc()
+	semaphore := make(chan struct{}, sub.SubscriberConfig.MaxPartitionCount)
+
+	for message := range sub.brokerPartitionAssignmentChan {
+		if assigned := message.GetAssignment(); assigned != nil {
+			wg.Add(1)
+			semaphore <- struct{}{}
+
+			topicPartition := topic.FromPbPartition(assigned.PartitionAssignment.Partition)
+
+			// wait until no covering partition is still in progress
+			sub.waitUntilNoOverlappingPartitionInFlight(topicPartition)
+
+			// start a processors
+			stopChan := make(chan struct{})
+			sub.activeProcessorsLock.Lock()
+			sub.activeProcessors[topicPartition] = &ProcessorState{
+				stopCh: stopChan,
 			}
-			for {
-				resp, err := subscribeClient.Recv()
-				if err != nil {
-					fmt.Printf("subscribe error: %v\n", err)
-					return
+			sub.activeProcessorsLock.Unlock()
+
+			go func(assigned *mq_pb.BrokerPartitionAssignment, topicPartition topic.Partition) {
+				defer func() {
+					sub.activeProcessorsLock.Lock()
+					delete(sub.activeProcessors, topicPartition)
+					sub.activeProcessorsLock.Unlock()
+
+					<-semaphore
+					wg.Done()
+				}()
+				glog.V(0).Infof("subscriber %s/%s assigned partition %+v at %v", sub.ContentConfig.Topic, sub.SubscriberConfig.ConsumerGroup, assigned.Partition, assigned.LeaderBroker)
+				sub.brokerPartitionAssignmentAckChan <- &mq_pb.SubscriberToSubCoordinatorRequest{
+					Message: &mq_pb.SubscriberToSubCoordinatorRequest_AckAssignment{
+						AckAssignment: &mq_pb.SubscriberToSubCoordinatorRequest_AckAssignmentMessage{
+							Partition: assigned.Partition,
+						},
+					},
 				}
-				if resp.Message == nil {
+
+				executors := util.NewLimitedConcurrentExecutor(int(sub.SubscriberConfig.SlidingWindowSize))
+				onDataMessageFn := func(m *mq_pb.SubscribeMessageResponse_Data) {
+					executors.Execute(func() {
+						processErr := sub.OnEachMessageFunc(m.Data.Key, m.Data.Value)
+						if processErr == nil {
+							sub.PartitionOffsetChan <- KeyedOffset{
+								Key:    m.Data.Key,
+								Offset: m.Data.TsNs,
+							}
+						}
+					})
+				}
+
+				err := sub.onEachPartition(assigned, stopChan, onDataMessageFn)
+				if err != nil {
+					glog.V(0).Infof("subscriber %s/%s partition %+v at %v: %v", sub.ContentConfig.Topic, sub.SubscriberConfig.ConsumerGroup, assigned.Partition, assigned.LeaderBroker, err)
+				} else {
+					glog.V(0).Infof("subscriber %s/%s partition %+v at %v completed", sub.ContentConfig.Topic, sub.SubscriberConfig.ConsumerGroup, assigned.Partition, assigned.LeaderBroker)
+				}
+				sub.brokerPartitionAssignmentAckChan <- &mq_pb.SubscriberToSubCoordinatorRequest{
+					Message: &mq_pb.SubscriberToSubCoordinatorRequest_AckUnAssignment{
+						AckUnAssignment: &mq_pb.SubscriberToSubCoordinatorRequest_AckUnAssignmentMessage{
+							Partition: assigned.Partition,
+						},
+					},
+				}
+			}(assigned.PartitionAssignment, topicPartition)
+		}
+		if unAssignment := message.GetUnAssignment(); unAssignment != nil {
+			topicPartition := topic.FromPbPartition(unAssignment.Partition)
+			sub.activeProcessorsLock.Lock()
+			if processor, found := sub.activeProcessors[topicPartition]; found {
+				close(processor.stopCh)
+				delete(sub.activeProcessors, topicPartition)
+			}
+			sub.activeProcessorsLock.Unlock()
+		}
+	}
+
+	wg.Wait()
+
+}
+
+func (sub *TopicSubscriber) waitUntilNoOverlappingPartitionInFlight(topicPartition topic.Partition) {
+	foundOverlapping := true
+	for foundOverlapping {
+		sub.activeProcessorsLock.Lock()
+		foundOverlapping = false
+		var overlappedPartition topic.Partition
+		for partition, _ := range sub.activeProcessors {
+			if partition.Overlaps(topicPartition) {
+				if partition.Equals(topicPartition) {
 					continue
 				}
-				switch m := resp.Message.(type) {
-				case *mq_pb.SubscribeResponse_Data:
-					if !sub.OnEachMessageFunc(m.Data.Key, m.Data.Value) {
-						return
-					}
-				case *mq_pb.SubscribeResponse_Ctrl:
-					// ignore
-				}
+				foundOverlapping = true
+				overlappedPartition = partition
+				break
 			}
-		}()
+		}
+		sub.activeProcessorsLock.Unlock()
+		if foundOverlapping {
+			glog.V(0).Infof("subscriber %s new partition %v waiting for partition %+v to complete", sub.ContentConfig.Topic, topicPartition, overlappedPartition)
+			time.Sleep(1 * time.Second)
+		}
 	}
-	wg.Wait()
-	return nil
 }

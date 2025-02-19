@@ -18,6 +18,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -35,7 +36,7 @@ type FilerPostResult struct {
 
 func (fs *FilerServer) assignNewFileInfo(so *operation.StorageOption) (fileId, urlLocation string, auth security.EncodedJwt, err error) {
 
-	stats.FilerRequestCounter.WithLabelValues(stats.ChunkAssign).Inc()
+	stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssign).Inc()
 	start := time.Now()
 	defer func() {
 		stats.FilerRequestHistogram.WithLabelValues(stats.ChunkAssign).Observe(time.Since(start).Seconds())
@@ -69,7 +70,6 @@ func (fs *FilerServer) assignNewFileInfo(so *operation.StorageOption) (fileId, u
 }
 
 func (fs *FilerServer) PostHandler(w http.ResponseWriter, r *http.Request, contentLength int64) {
-
 	ctx := context.Background()
 
 	destination := r.RequestURI
@@ -99,6 +99,12 @@ func (fs *FilerServer) PostHandler(w http.ResponseWriter, r *http.Request, conte
 		return
 	}
 
+	if util.FullPath(r.URL.Path).IsLongerFileName(so.MaxFileNameLength) {
+		glog.V(1).Infoln("post", r.RequestURI, ": ", "entry name too long")
+		w.WriteHeader(http.StatusRequestURITooLong)
+		return
+	}
+
 	// When DiskType is empty,use filer's -disk
 	if so.DiskType == "" {
 		so.DiskType = fs.option.DiskType
@@ -114,7 +120,7 @@ func (fs *FilerServer) PostHandler(w http.ResponseWriter, r *http.Request, conte
 		fs.autoChunk(ctx, w, r, contentLength, so)
 	}
 
-	util.CloseRequest(r)
+	util_http.CloseRequest(r)
 
 }
 
@@ -142,10 +148,26 @@ func (fs *FilerServer) move(ctx context.Context, w http.ResponseWriter, r *http.
 
 	srcPath := util.FullPath(src)
 	dstPath := util.FullPath(dst)
+	if dstPath.IsLongerFileName(so.MaxFileNameLength) {
+		err = fmt.Errorf("dst name to long")
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
 	srcEntry, err := fs.filer.FindEntry(ctx, srcPath)
 	if err != nil {
 		err = fmt.Errorf("failed to get src entry '%s', err: %s", src, err)
 		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	wormEnforced, err := fs.wormEnforcedForEntry(ctx, src)
+	if err != nil {
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	} else if wormEnforced {
+		// you cannot move a worm file or directory
+		err = fmt.Errorf("cannot move write-once entry from '%s' to '%s': operation not permitted", src, dst)
+		writeJsonError(w, r, http.StatusForbidden, err)
 		return
 	}
 
@@ -185,7 +207,6 @@ func (fs *FilerServer) move(ctx context.Context, w http.ResponseWriter, r *http.
 // curl -X DELETE http://localhost:8888/path/to?recursive=true&ignoreRecursiveError=true
 // curl -X DELETE http://localhost:8888/path/to?recursive=true&skipChunkDeletion=true
 func (fs *FilerServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
-
 	isRecursive := r.FormValue("recursive") == "true"
 	if !isRecursive && fs.option.recursiveDelete {
 		if r.FormValue("recursive") != "false" {
@@ -200,16 +221,19 @@ func (fs *FilerServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		objectPath = objectPath[0 : len(objectPath)-1]
 	}
 
-	err := fs.filer.DeleteEntryMetaAndData(context.Background(), util.FullPath(objectPath), isRecursive, ignoreRecursiveError, !skipChunkDeletion, false, nil)
+	wormEnforced, err := fs.wormEnforcedForEntry(context.TODO(), objectPath)
 	if err != nil {
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	} else if wormEnforced {
+		writeJsonError(w, r, http.StatusForbidden, errors.New("operation not permitted"))
+		return
+	}
+
+	err = fs.filer.DeleteEntryMetaAndData(context.Background(), util.FullPath(objectPath), isRecursive, ignoreRecursiveError, !skipChunkDeletion, false, nil, 0)
+	if err != nil && err != filer_pb.ErrNotFound {
 		glog.V(1).Infoln("deleting", objectPath, ":", err.Error())
-		httpStatus := http.StatusInternalServerError
-		if err == filer_pb.ErrNotFound {
-			httpStatus = http.StatusNoContent
-			writeJsonQuiet(w, r, httpStatus, nil)
-			return
-		}
-		writeJsonError(w, r, httpStatus, err)
+		writeJsonError(w, r, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -222,6 +246,10 @@ func (fs *FilerServer) detectStorageOption(requestURI, qCollection, qReplication
 
 	if rule.ReadOnly {
 		return nil, ErrReadOnly
+	}
+
+	if rule.MaxFileNameLength == 0 {
+		rule.MaxFileNameLength = fs.filer.MaxFilenameLength
 	}
 
 	// required by buckets folder
@@ -248,6 +276,7 @@ func (fs *FilerServer) detectStorageOption(requestURI, qCollection, qReplication
 		DiskType:          util.Nvl(diskType, rule.DiskType),
 		Fsync:             rule.Fsync,
 		VolumeGrowthCount: rule.VolumeGrowthCount,
+		MaxFileNameLength: rule.MaxFileNameLength,
 	}, nil
 }
 

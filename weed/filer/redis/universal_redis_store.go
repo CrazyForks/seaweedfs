@@ -3,11 +3,11 @@ package redis
 import (
 	"context"
 	"fmt"
-	"golang.org/x/exp/slices"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -164,8 +164,8 @@ func (store *UniversalRedisStore) ListDirectoryEntries(ctx context.Context, dirP
 	}
 
 	// sort
-	slices.SortFunc(members, func(a, b string) bool {
-		return strings.Compare(a, b) < 0
+	slices.SortFunc(members, func(a, b string) int {
+		return strings.Compare(a, b)
 	})
 
 	// limit
